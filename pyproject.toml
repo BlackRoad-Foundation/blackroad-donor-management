@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blackroad-donor-management"
+version = "1.0.0"
+description = "Production-ready donor management and fundraising tracker for nonprofits — SQLite-backed, Stripe-integrated, zero mandatory dependencies."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+keywords = ["nonprofit", "donor-management", "fundraising", "crm", "stripe", "donations"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = []
+
+[project.optional-dependencies]
+stripe = ["stripe>=7.0.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "stripe>=7.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/BlackRoad-Foundation/blackroad-donor-management"
+Repository = "https://github.com/BlackRoad-Foundation/blackroad-donor-management"
+"Bug Tracker" = "https://github.com/BlackRoad-Foundation/blackroad-donor-management/issues"
+Changelog = "https://github.com/BlackRoad-Foundation/blackroad-donor-management/releases"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["donor_management*"]
+
+[tool.pytest.ini_options]
+testpaths = ["test_donor_management.py"]

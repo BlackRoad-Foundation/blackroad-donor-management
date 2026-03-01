@@ -49,6 +49,7 @@ class DonationMethod(str, Enum):
     CRYPTO = "crypto"
     CASH = "cash"
     STOCK = "stock"
+    STRIPE = "stripe"
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +88,7 @@ class Donation:
     received_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
     notes: str = ""
     reference_number: str = ""
+    stripe_charge_id: str = ""
 
 
 @dataclass
@@ -144,7 +146,8 @@ class DonorDatabase:
                     tax_receipt_sent INTEGER DEFAULT 0,
                     received_at      TEXT NOT NULL,
                     notes            TEXT DEFAULT '',
-                    reference_number TEXT DEFAULT ''
+                    reference_number TEXT DEFAULT '',
+                    stripe_charge_id TEXT DEFAULT ''
                 );
 
                 CREATE TABLE IF NOT EXISTS campaigns (
@@ -162,6 +165,12 @@ class DonorDatabase:
                 CREATE INDEX IF NOT EXISTS idx_don_campaign ON donations(campaign);
                 CREATE INDEX IF NOT EXISTS idx_donor_tier ON donors(tier);
             """)
+        # Migrate existing databases that pre-date the stripe_charge_id column
+        try:
+            self.conn.execute("ALTER TABLE donations ADD COLUMN stripe_charge_id TEXT DEFAULT ''")
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +297,7 @@ class DonorManagement:
         notes: str = "",
         reference_number: str = "",
         received_at: Optional[str] = None,
+        stripe_charge_id: str = "",
     ) -> Donation:
         """Record a donation and update donor totals and tier."""
         if not self.get_donor(donor_id):
@@ -297,17 +307,18 @@ class DonorManagement:
             id=str(uuid.uuid4()), donor_id=donor_id, amount=amount,
             campaign=campaign, type=donation_type, method=method,
             notes=notes, reference_number=reference_number,
-            received_at=now,
+            received_at=now, stripe_charge_id=stripe_charge_id,
         )
         with self.conn:
             self.conn.execute(
                 """INSERT INTO donations
                    (id, donor_id, amount, campaign, type, method, acknowledged,
-                    tax_receipt_sent, received_at, notes, reference_number)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    tax_receipt_sent, received_at, notes, reference_number, stripe_charge_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (donation.id, donation.donor_id, donation.amount, donation.campaign,
                  donation.type.value, donation.method.value, 0, 0,
-                 donation.received_at, donation.notes, donation.reference_number),
+                 donation.received_at, donation.notes, donation.reference_number,
+                 donation.stripe_charge_id),
             )
             # Update donor totals
             self.conn.execute(
@@ -366,6 +377,67 @@ class DonorManagement:
                 (donation_id,),
             )
         return self.get_donation(donation_id)
+
+    def process_stripe_payment(
+        self,
+        donor_id: str,
+        amount_cents: int,
+        campaign: str,
+        payment_method_id: str,
+        stripe_api_key: str,
+        donation_type: DonationType = DonationType.ONE_TIME,
+        notes: str = "",
+        currency: str = "usd",
+    ) -> Donation:
+        """Charge a card via Stripe and record the resulting donation.
+
+        Requires the ``stripe`` package (``pip install blackroad-donor-management[stripe]``).
+
+        Args:
+            donor_id: Internal donor UUID.
+            amount_cents: Charge amount **in cents** (e.g. ``5000`` = $50.00).
+            campaign: Campaign name the gift is attributed to.
+            payment_method_id: Stripe ``pm_…`` token from the frontend.
+            stripe_api_key: Your Stripe secret key (``sk_live_…`` / ``sk_test_…``).
+            donation_type: ONE_TIME or RECURRING.
+            notes: Optional internal notes.
+            currency: ISO 4217 currency code (default ``"usd"``).
+
+        Returns:
+            The recorded :class:`Donation` with ``stripe_charge_id`` populated.
+
+        Raises:
+            ImportError: If the ``stripe`` package is not installed.
+            stripe.StripeError: On any Stripe API error.
+            ValueError: If the donor does not exist.
+        """
+        try:
+            import stripe as _stripe
+        except ImportError as exc:
+            raise ImportError(
+                "Install the stripe extra to use process_stripe_payment: "
+                "pip install blackroad-donor-management[stripe]"
+            ) from exc
+
+        _stripe.api_key = stripe_api_key
+        intent = _stripe.PaymentIntent.create(
+            amount=amount_cents,
+            currency=currency,
+            payment_method=payment_method_id,
+            confirm=True,
+            automatic_payment_methods={"enabled": True, "allow_redirects": "never"},
+        )
+        charge_id = intent.get("id", "")
+        amount_dollars = amount_cents / 100.0
+        return self.record_donation(
+            donor_id=donor_id,
+            amount=amount_dollars,
+            campaign=campaign,
+            donation_type=donation_type,
+            method=DonationMethod.STRIPE,
+            notes=notes,
+            stripe_charge_id=charge_id,
+        )
 
     # -----------------------------------------------------------------------
     # Tier management
@@ -521,6 +593,7 @@ class DonorManagement:
             tax_receipt_sent=bool(row["tax_receipt_sent"]),
             received_at=row["received_at"], notes=row["notes"],
             reference_number=row["reference_number"],
+            stripe_charge_id=row["stripe_charge_id"] or "",
         )
 
     def close(self) -> None:
