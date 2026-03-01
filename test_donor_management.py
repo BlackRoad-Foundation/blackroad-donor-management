@@ -93,3 +93,123 @@ def test_list_by_tier(dm):
     dm.record_donation(d.id, 15_000, "Capital")
     gold_donors = dm.list_donors(tier=DonorTier.GOLD)
     assert len(gold_donors) == 1
+
+# ---------------------------------------------------------------------------
+# Stripe integration tests
+# ---------------------------------------------------------------------------
+
+def test_stripe_method_exists():
+    """DonationMethod.STRIPE must be a valid enum value."""
+    from donor_management import DonationMethod
+    assert DonationMethod.STRIPE == "stripe"
+
+def test_record_donation_with_stripe_charge_id(dm):
+    """Storing a stripe_charge_id round-trips through the DB correctly."""
+    d = dm.add_donor("N", "n@test.com")
+    donation = dm.record_donation(
+        d.id, 100, "Fund",
+        method=DonationMethod.STRIPE,
+        stripe_charge_id="pi_test_abc123",
+    )
+    assert donation.stripe_charge_id == "pi_test_abc123"
+    assert donation.method == DonationMethod.STRIPE
+    fetched = dm.get_donation(donation.id)
+    assert fetched.stripe_charge_id == "pi_test_abc123"
+
+def test_process_stripe_payment_missing_package(dm):
+    """process_stripe_payment raises ImportError when stripe is not installed."""
+    import sys, unittest.mock
+    d = dm.add_donor("O", "o@test.com")
+    with unittest.mock.patch.dict(sys.modules, {"stripe": None}):
+        with pytest.raises(ImportError, match="stripe"):
+            dm.process_stripe_payment(
+                donor_id=d.id,
+                amount_cents=5000,
+                campaign="Fund",
+                payment_method_id="pm_test",
+                stripe_api_key="sk_test_fake",
+            )
+
+def test_process_stripe_payment_mocked(dm):
+    """process_stripe_payment records donation using mocked Stripe SDK."""
+    import unittest.mock
+    d = dm.add_donor("P", "p@test.com")
+    fake_intent = {"id": "pi_mock_xyz789"}
+    mock_stripe = unittest.mock.MagicMock()
+    mock_stripe.PaymentIntent.create.return_value = fake_intent
+
+    import sys
+    with unittest.mock.patch.dict(sys.modules, {"stripe": mock_stripe}):
+        donation = dm.process_stripe_payment(
+            donor_id=d.id,
+            amount_cents=7500,
+            campaign="Annual Fund 2025",
+            payment_method_id="pm_test_card",
+            stripe_api_key="sk_test_fake",
+        )
+
+    assert donation.amount == 75.0
+    assert donation.stripe_charge_id == "pi_mock_xyz789"
+    assert donation.method == DonationMethod.STRIPE
+    updated = dm.get_donor(d.id)
+    assert updated.total_given == 75.0
+
+# ---------------------------------------------------------------------------
+# End-to-end scenario
+# ---------------------------------------------------------------------------
+
+def test_e2e_full_donor_lifecycle(dm):
+    """E2E: create campaign → add donor → donate via Stripe → receipt → analytics."""
+    import unittest.mock
+
+    # 1. Campaign
+    dm.create_campaign("E2E Campaign", 50_000, "2025-01-01", "2025-12-31")
+
+    # 2. Donor
+    donor = dm.add_donor(
+        "Test Donor", "e2e@test.com",
+        phone="555-0000",
+        donor_type=DonorType.INDIVIDUAL,
+        assigned_to="TestRep",
+    )
+    assert donor.tier == DonorTier.BRONZE
+
+    # 3. Non-Stripe donation brings donor to Silver
+    dm.record_donation(donor.id, 1_200, "E2E Campaign", method=DonationMethod.CHECK)
+    assert dm.get_donor(donor.id).tier == DonorTier.SILVER
+
+    # 4. Stripe donation via mocked SDK
+    fake_intent = {"id": "pi_e2e_stripe_001"}
+    mock_stripe = unittest.mock.MagicMock()
+    mock_stripe.PaymentIntent.create.return_value = fake_intent
+    import sys
+    with unittest.mock.patch.dict(sys.modules, {"stripe": mock_stripe}):
+        stripe_don = dm.process_stripe_payment(
+            donor_id=donor.id,
+            amount_cents=900000,  # $9,000 → pushes total to $10,200 → Gold
+            campaign="E2E Campaign",
+            payment_method_id="pm_e2e_card",
+            stripe_api_key="sk_test_fake",
+        )
+    assert stripe_don.stripe_charge_id == "pi_e2e_stripe_001"
+    assert dm.get_donor(donor.id).tier == DonorTier.GOLD
+
+    # 5. Receipt
+    receipt = dm.send_receipt(stripe_don.id)
+    assert receipt.tax_receipt_sent
+    assert receipt.acknowledged
+
+    # 6. LTV analytics
+    ltv = dm.ltv(donor.id)
+    assert ltv["ltv"] == 10_200.0
+    assert ltv["donation_count"] == 2
+    assert "E2E Campaign" in ltv["campaigns"]
+
+    # 7. Campaign summary
+    summary = dm.campaign_summary("E2E Campaign")
+    assert summary["total_raised"] == 10_200.0
+    assert summary["progress_pct"] == pytest.approx(20.4, rel=1e-2)
+
+    # 8. Retention report runs without error
+    report = dm.retention_report()
+    assert "year" in report
